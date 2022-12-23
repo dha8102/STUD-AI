@@ -10,6 +10,7 @@ class BERT_onlyClassification(BertPreTrainedModel):
         super(BERT_onlyClassification, self).__init__(config)
         self.bert = BertModel(config)
         self.f_mlp = nn.Sequential(
+            nn.Dropout(0.3),
             nn.Linear(768, 200),
             nn.ReLU(inplace=True),
             nn.Dropout(0.3),

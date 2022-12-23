@@ -20,7 +20,8 @@ from models.MLP import MLP_Classification
 from models.BERT_only import BERT_onlyClassification
 from util import scoring_softmax as scoring
 import torch.nn.functional as F
-# from focal_loss.focal_loss import FocalLoss
+from focal_loss.focal_loss import FocalLoss
+from sklearn.neural_network import MLPClassifier
 
 if __name__ == "__main__":
 
@@ -33,19 +34,14 @@ if __name__ == "__main__":
     parser.add_argument('--sampling_weight', type=float, default=0, help='0 is not use, -1 for real sample ratio')
     parser.add_argument('--class_weight', type=float, default=0, help='0 is not use, -1 for real sample ratio')
     parser.add_argument('--maxlen', type=int, default=512)
-    parser.add_argument('--model', type=str, default='MLP', help='MLP, BERT_MLP, BERT_only, RoBERTa_only, dem, beh')
+    parser.add_argument('--model', type=str, default='MLP', help='MLP or BERT_MLP')
     parser.add_argument('--acc_steps', type=int, default=36, help='gradient accumulation steps')
     parser.add_argument('--epochs', type=int, default=10, help='epochs')
-
     args = parser.parse_args()
     if args.model == 'BERT_MLP':
-        folder_path = './saved_model_BERT_MLP_step/'
+        folder_path = './saved_model_BERT_MLP/'
     elif args.model == 'BERT_only':
         folder_path = './saved_model_BERT_only/'
-    elif args.model == 'roberta-base_MLP':
-        folder_path = './saved_model_roberta-base_MLP/'
-    elif args.model == 'roberta-large_MLP':
-        folder_path = './saved_model_roberta-large/'
     elif args.model == 'MLP':
         folder_path = './saved_model_MLP/'
     elif args.model == 'dem':
@@ -78,32 +74,20 @@ if __name__ == "__main__":
     val_file = './dataset_onehot/preprocessed_val_onehot_minmax_dummy.csv'
     test_file = './dataset_onehot/preprocessed_test_onehot_minmax_dummy.csv'
 
-    if cfg.model == 'BERT_MLP' or cfg.model == 'dem' or cfg.model == 'beh':
+    print("cfg.model:",cfg.model)
+    if cfg.model == 'BERT_MLP':
         model = BERT_MLPClassification.from_pretrained("klue/bert-base", num_labels=2).to(device)
         tokenizer = AutoTokenizer.from_pretrained("klue/bert-base", model_max_length=512)
 
-    elif cfg.model == 'roberta-base_MLP':
-        model = BERT_MLPClassification.from_pretrained("klue/roberta-base", num_labels=2).to(device)
-        tokenizer = AutoTokenizer.from_pretrained("klue/roberta-base", model_max_length=512)
-
-    elif cfg.model == 'roberta-large_MLP':
-        model = BERT_MLPClassification.from_pretrained("klue/roberta-large", num_labels=2).to(device)
-        tokenizer = AutoTokenizer.from_pretrained("klue/roberta-large", model_max_length=512)
-
-    elif cfg.model == 'BERT_only':
+    elif cfg.model in ['BERT_only', 'dem', 'beh']:
         model = BERT_onlyClassification.from_pretrained("klue/bert-base", num_labels=2).to(device)
         tokenizer = AutoTokenizer.from_pretrained("klue/bert-base", model_max_length=512)
     elif cfg.model == 'MLP':
         model = MLP_Classification().to(device)
         tokenizer = None
-    elif cfg.model == 'RoBERTa_only':
-        model = BERT_onlyClassification.from_pretrained("klue/roberta-small", num_labels=2).to(device)
-        tokenizer = AutoTokenizer.from_pretrained("klue/roberta-small", model_max_length=512)
-
     else:
         model = BERT_onlyClassification.from_pretrained("klue/bert-base", num_labels=2).to(device)
         tokenizer = AutoTokenizer.from_pretrained("klue/bert-base", model_max_length=512)
-
     # model freeze (only classifier is trained)
     # for name, param in model.bert.named_parameters():
     #     if 'weight' in name:
@@ -156,7 +140,6 @@ if __name__ == "__main__":
         else:
             return torch.FloatTensor(weights).to(device)
 
-
     sampling_weight = create_weights(cfg.sampling_weight, 'sampling')
     class_weight = create_weights(cfg.class_weight, 'class')
 
@@ -171,7 +154,7 @@ if __name__ == "__main__":
 
     optimizer = AdamW(model.parameters(), lr=cfg.lr)
     num_warmup_steps = int(train_dataset.__len__() / cfg.batch_size / 20)
-    num_training_steps = int(train_dataset.__len__() / cfg.batch_size) * cfg.epochs
+    num_training_steps = int(train_dataset.__len__() / cfg.batch_size) * cfg.epochs * 10
     scheduler = linear_lr(optimizer, num_warmup_steps=num_warmup_steps,
                           num_training_steps=num_training_steps)
     # scheduler = LinearLR(optimizer, start_factor=0.5, total_iters=3)
@@ -195,8 +178,6 @@ if __name__ == "__main__":
     min_loss = 100000
     scaler = torch.cuda.amp.GradScaler(enabled=False)
 
-    check_step = 100
-
     for _ in range(cfg.epochs):
         torch.cuda.empty_cache()
         epochs += 1
@@ -213,14 +194,16 @@ if __name__ == "__main__":
             input_ids = batch[2].to(device)
             att_mask = batch[3].to(device)
             with torch.cuda.amp.autocast(enabled=False):
-                if cfg.model == 'BERT_MLP' or 'BERT_only':
-                    logits = model(model_input, input_ids, att_mask)
-                elif cfg.model == 'MLP':
+                if cfg.model == 'MLP':
                     logits = model(model_input)
+                else:
+                    logits = model(model_input, input_ids, att_mask)
+
             # logits = F.softmax(logits, dim=-1)
             # labels_onehot = F.one_hot(labels, num_classes=2)
             loss = criterion(logits, labels)
             train_loss += loss.item()
+
             # scaler.scale(loss).backward()
             loss.backward()
 
@@ -231,7 +214,7 @@ if __name__ == "__main__":
                 scheduler.step()
                 # scaler.step(scheduler)
                 # scaler.update()
-                optimizer.zero_grad()
+                model.zero_grad()
             global_steps += 1
             logits = logits.cpu().detach().numpy()
             labels = labels.cpu().numpy()
@@ -258,221 +241,147 @@ if __name__ == "__main__":
                               global_step=global_steps)
             data_cnt += len(labels)
 
-            if global_steps % check_step == 0:
-                try:
-                    trn_pre = trn_bunja / trn_pre_bunmo
-                except:
-                    trn_pre = 0
-                try:
-                    trn_rec = trn_bunja / trn_rec_bunmo
-                except:
-                    trn_rec = 0
-                try:
-                    trn_f1 = 2 * (trn_pre * trn_rec) / (trn_pre + trn_rec)
-                except:
-                    trn_f1 = 0
-                writer.add_scalar(tag='train_loss',
-                                  scalar_value=train_loss / data_cnt,
-                                  global_step=epochs)
-                writer.add_scalar(tag='train_accuracy',
-                                  scalar_value=train_acc / data_cnt,
-                                  global_step=epochs)
-                writer.add_scalar(tag='train_precision',
-                                  scalar_value=trn_pre,
-                                  global_step=epochs)
-                writer.add_scalar(tag='train_recall',
-                                  scalar_value=trn_rec,
-                                  global_step=epochs)
-                writer.add_scalar(tag='train_F1',
-                                  scalar_value=trn_f1,
-                                  global_step=epochs)
 
-                # validation
-                model.eval()
-                val_loss = 0
-                val_acc = 0
-                val_data_cnt = 0
-                val_bunja = 0
-                val_pre_bunmo = 0
-                val_rec_bunmo = 0
-                for i, batch in tqdm(enumerate(val_dataloader), total=len(val_dataloader), desc='validation'):
-                    model_input = batch[0].to(device)
-                    labels = batch[1].to(device)
-                    input_ids = batch[2].to(device)
-                    att_mask = batch[3].to(device)
-                    with torch.cuda.amp.autocast(enabled=False):
-                        with torch.no_grad():
-                            if cfg.model == 'MLP':
-                                logits = model(model_input)
-                            else:
-                                logits = model(model_input, input_ids, att_mask)
 
-                    # logits = F.softmax(logits, dim=-1)
-                    # labels_onehot = F.one_hot(labels, num_classes=2)
-                    loss = criterion(logits, labels)
-                    val_loss += loss.item()
-                    logits = logits.cpu().detach().numpy()
-                    labels = labels.cpu().numpy()
+        train_loss /= data_cnt
+        train_acc /= data_cnt
+        try:
+            trn_pre = trn_bunja / trn_pre_bunmo
+        except:
+            trn_pre = 0
+        try:
+            trn_rec = trn_bunja / trn_rec_bunmo
+        except:
+            trn_rec = 0
+        try:
+            trn_f1 = 2 * (trn_pre * trn_rec) / (trn_pre + trn_rec)
+        except:
+            trn_f1 = 0
+        writer.add_scalar(tag='train_loss',
+                          scalar_value=train_loss,
+                          global_step=epochs)
+        writer.add_scalar(tag='train_accuracy',
+                          scalar_value=train_acc,
+                          global_step=epochs)
+        writer.add_scalar(tag='train_precision',
+                          scalar_value=trn_pre,
+                          global_step=epochs)
+        writer.add_scalar(tag='train_recall',
+                          scalar_value=trn_rec,
+                          global_step=epochs)
+        writer.add_scalar(tag='train_F1',
+                          scalar_value=trn_f1,
+                          global_step=epochs)
 
-                    acc, precision, recall, f1, bunja, pre_bunmo, rec_bunmo = scoring(logits, labels, 'val')
-                    val_bunja += bunja
-                    val_pre_bunmo += pre_bunmo
-                    val_rec_bunmo += rec_bunmo
-                    val_acc += acc
-                    val_data_cnt += len(labels)
+        model.eval()
+        val_loss = 0
+        val_acc = 0
+        data_cnt = 0
+        val_bunja = 0
+        val_pre_bunmo = 0
+        val_rec_bunmo = 0
+        for i, batch in tqdm(enumerate(val_dataloader), total=len(val_dataloader), desc='validation'):
+            model_input = batch[0].to(device)
+            labels = batch[1].to(device)
+            with torch.cuda.amp.autocast(enabled=False):
+                with torch.no_grad():
+                    if cfg.model == 'MLP':
+                        logits = model(model_input)
+                    else:
+                        logits = model(model_input, input_ids, att_mask)
+            # logits = F.softmax(logits, dim=-1)
+            # labels_onehot = F.one_hot(labels, num_classes=2)
+            loss = criterion(logits, labels)
+            val_loss += loss.item()
+            logits = logits.cpu().detach().numpy()
+            labels = labels.cpu().numpy()
 
-                val_loss /= val_data_cnt
-                val_acc /= val_data_cnt
-                try:
-                    val_pre = val_bunja / val_pre_bunmo
-                except:
-                    val_pre = 0
-                try:
-                    val_rec = val_bunja / val_rec_bunmo
-                except:
-                    val_rec = 0
-                try:
-                    val_f1 = 2 * (val_pre * val_rec) / (val_pre + val_rec)
-                except:
-                    val_f1 = 0
-                writer.add_scalar(tag='val_loss',
-                                  scalar_value=val_loss,
-                                  global_step=epochs)
-                writer.add_scalar(tag='val_accuracy',
-                                  scalar_value=val_acc,
-                                  global_step=epochs)
-                writer.add_scalar(tag='val_precision',
-                                  scalar_value=val_pre,
-                                  global_step=epochs)
-                writer.add_scalar(tag='val_recall',
-                                  scalar_value=val_rec,
-                                  global_step=epochs)
-                writer.add_scalar(tag='val_F1',
-                                  scalar_value=val_f1,
-                                  global_step=epochs)
+            acc, precision, recall, f1, bunja, pre_bunmo, rec_bunmo = scoring(logits, labels, 'val')
+            val_bunja += bunja
+            val_pre_bunmo += pre_bunmo
+            val_rec_bunmo += rec_bunmo
+            val_acc += acc
+            data_cnt += len(labels)
 
-                print("=============================")
-                print("epoch:", epochs)
-                print("train_loss:", train_loss)
-                print("train_acc:", train_acc)
-                print("train_precision:", trn_pre)
-                print("train_recall:", trn_rec)
-                print("train_f1:", trn_f1)
-                print("val_loss:", val_loss)
-                print("val_acc:", val_acc)
-                print("val_precision:", val_pre)
-                print("val_recall:", val_rec)
-                print("val_f1:", val_f1)
+        val_loss /= data_cnt
+        val_acc /= data_cnt
+        try:
+            val_pre = val_bunja / val_pre_bunmo
+        except:
+            val_pre = 0
+        try:
+            val_rec = val_bunja / val_rec_bunmo
+        except:
+            val_rec = 0
+        try:
+            val_f1 = 2 * (val_pre * val_rec) / (val_pre + val_rec)
+        except:
+            val_f1 = 0
+        writer.add_scalar(tag='val_loss',
+                          scalar_value=val_loss,
+                          global_step=epochs)
+        writer.add_scalar(tag='val_accuracy',
+                          scalar_value=val_acc,
+                          global_step=epochs)
+        writer.add_scalar(tag='val_precision',
+                          scalar_value=val_pre,
+                          global_step=epochs)
+        writer.add_scalar(tag='val_recall',
+                          scalar_value=val_rec,
+                          global_step=epochs)
+        writer.add_scalar(tag='val_F1',
+                          scalar_value=val_f1,
+                          global_step=epochs)
 
-                # f1 기반 early stopping
-                if val_f1 > max_f1:
-                    max_f1 = val_f1
-                    stop_cnt = 0
-                    is_best = True
-                else:
-                    stop_cnt += 1
-                    is_best = False
+        print("=============================")
+        print("epoch", epochs)
+        print("train_loss:", train_loss)
+        print("train_acc:", train_acc)
+        print("train_precision:", trn_pre)
+        print("train_recall:", trn_rec)
+        print("train_f1:", trn_f1)
+        print("val_loss:", val_loss)
+        print("val_acc:", val_acc)
+        print("val_precision:", val_pre)
+        print("val_recall:", val_rec)
+        print("val_f1:", val_f1)
 
-                # val_loss 기반 early stopping
-                # if val_loss < min_loss:
-                #     min_loss = val_loss
-                #     stop_cnt = 0
-                #     is_best = True
-                # else:
-                #     stop_cnt += 1
-                #     is_best = False
+        # f1 기반 early stopping
+        if val_f1 > max_f1:
+            max_f1 = val_f1
+            stop_cnt = 0
+            is_best = True
+        else:
+            stop_cnt += 1
+            is_best = False
 
-                if is_best:
-                    state = {
-                        'epoch': epochs,
-                        'model': model,
-                        'state_dict': model.state_dict(),
-                        'acc': val_acc,
-                        'precision': val_pre,
-                        'recall': val_rec,
-                        'f1-score': val_f1,
-                        'optimizer': optimizer.state_dict()
-                    }
-                    torch.save(state, save_path + '/model_best.pth.tar')
+        # val_loss 기반 early stopping
+        # if val_loss < min_loss:
+        #     min_loss = val_loss
+        #     stop_cnt = 0
+        #     is_best = True
+        # else:
+        #     stop_cnt += 1
+        #     is_best = False
 
-                if stop_cnt > cfg.threshold:
-                    print("Training finished.")
-                    break
+        if is_best:
+            state = {
+                'epoch': epochs,
+                'model': model,
+                'state_dict': model.state_dict(),
+                'acc': val_acc,
+                'precision': val_pre,
+                'recall': val_rec,
+                'f1-score': val_f1,
+                'optimizer': optimizer.state_dict()
+            }
+            torch.save(state, save_path + '/model_best.pth.tar')
 
-                # middle_test
-                model.eval()
-                val_loss = 0
-                val_acc = 0
-                data_cnt = 0
-                val_bunja = 0
-                val_pre_bunmo = 0
-                val_rec_bunmo = 0
-                for i, batch in tqdm(enumerate(eval_dataloader), total=len(eval_dataloader), desc='middle_eval'):
-                    model_input = batch[0].to(device)
-                    labels = batch[1].to(device)
-                    input_ids = batch[2].to(device)
-                    att_mask = batch[3].to(device)
-                    with torch.cuda.amp.autocast(enabled=False):
-                        with torch.no_grad():
-                            if cfg.model == 'MLP':
-                                logits = model(model_input)
-                            else:
-                                logits = model(model_input, input_ids, att_mask)
+        if stop_cnt > cfg.threshold:
+            print("Training finished.")
+            break
 
-                    # logits = F.softmax(logits, dim=-1)
-                    # labels_onehot = F.one_hot(labels, num_classes=2)
-                    loss = criterion(logits, labels)
-                    val_loss += loss.item()
-                    logits = logits.cpu().detach().numpy()
-                    labels = labels.cpu().numpy()
-
-                    acc, precision, recall, f1, bunja, pre_bunmo, rec_bunmo = scoring(logits, labels, 'val')
-                    val_bunja += bunja
-                    val_pre_bunmo += pre_bunmo
-                    val_rec_bunmo += rec_bunmo
-                    val_acc += acc
-                    data_cnt += len(labels)
-
-                val_loss /= data_cnt
-                val_acc /= data_cnt
-                try:
-                    val_pre = val_bunja / val_pre_bunmo
-                except:
-                    val_pre = 0
-                try:
-                    val_rec = val_bunja / val_rec_bunmo
-                except:
-                    val_rec = 0
-                try:
-                    val_f1 = 2 * (val_pre * val_rec) / (val_pre + val_rec)
-                except:
-                    val_f1 = 0
-                writer.add_scalar(tag='eval_loss',
-                                  scalar_value=val_loss,
-                                  global_step=global_steps)
-                writer.add_scalar(tag='eval_accuracy',
-                                  scalar_value=val_acc,
-                                  global_step=global_steps)
-                writer.add_scalar(tag='eval_precision',
-                                  scalar_value=val_pre,
-                                  global_step=global_steps)
-                writer.add_scalar(tag='eval_recall',
-                                  scalar_value=val_rec,
-                                  global_step=global_steps)
-                writer.add_scalar(tag='eval_F1',
-                                  scalar_value=val_f1,
-                                  global_step=global_steps)
-
-                print("=============================")
-                print("★★★★middle_eval★★★★")
-                print("epoch", epochs)
-                print("eval_loss:", val_loss)
-                print("eval_acc:", val_acc)
-                print("eval_precision:", val_pre)
-                print("eval_recall:", val_rec)
-                print("eval_f1:", val_f1)
-
-    # last evaluation
+    # evaluation
     model_state_dict = torch.load(save_path + '/model_best.pth.tar', map_location=device)['state_dict']
     model.load_state_dict(model_state_dict)
 
@@ -485,14 +394,12 @@ if __name__ == "__main__":
     for i, batch in tqdm(enumerate(eval_dataloader), total=len(eval_dataloader), desc='testing:'):
         model_input = batch[0].to(device)
         labels = batch[1].to(device)
-        input_ids = batch[2].to(device)
-        att_mask = batch[3].to(device)
         with torch.cuda.amp.autocast(enabled=False):
             with torch.no_grad():
-                if cfg.model == 'BERT_MLP' or 'BERT_only':
-                    logits = model(model_input, input_ids, att_mask)
-                elif cfg.model == 'MLP':
+                if cfg.model == 'MLP':
                     logits = model(model_input)
+                else:
+                    logits = model(model_input, input_ids, att_mask)
         logits = logits.cpu().detach().numpy()
         labels = labels.cpu().numpy()
         acc, precision, recall, f1, bunja, pre_bunmo, rec_bunmo = scoring(logits, labels, 'val')
@@ -522,6 +429,7 @@ if __name__ == "__main__":
     print("eval_recall:", eval_rec)
     print("eval_f1:", eval_f1)
     with open(save_path + '/test_result.txt', 'w') as f:
+
         f.write("eval_precision: " + str(eval_pre) + '\n')
         f.write("eval_recall: " + str(eval_rec) + '\n')
         f.write("eval_F1 : " + str(eval_f1) + '\n')
